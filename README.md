@@ -1,3 +1,12 @@
+> **Unofficial fork - Signal features for Hermes Agent.**
+> This repository adds six small, opt-in Signal/gateway improvements on top of upstream
+> [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent): group wake words, quote replies,
+> reactions instead of text, real @mentions, emoji-only replies as reactions, and an optional quiet silence marker.
+> See **[docs/SIGNAL_FEATURES.md](docs/SIGNAL_FEATURES.md)** for what each does, the config keys, and how to apply
+> them individually (git cherry-pick or the patch files in [`docs/patches/`](docs/patches/)).
+> Tested on Hermes v0.21.6+509. Upstream license (MIT) unchanged, provided as is, no warranty. Not affiliated with
+> or endorsed by Nous Research. Everything below this note is the unmodified upstream README.
+
 <p align="center">
   <img src="assets/banner.png" alt="Hermes Agent" width="100%">
 </p>

@@ -1,0 +1,96 @@
+From 302db49b7d26299e54fbb7661879b3e2724b9154 Mon Sep 17 00:00:00 2001
+From: ZetOmega <70434161+ZetOmega@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 17:43:40 +0200
+Subject: [PATCH] gateway: optionally stay silent on bare silence markers
+ (gateway.warn_on_unexpected_silence)
+
+Upstream sends a "model returned only a silence marker" warning when the model
+answers a human turn with a bare NO_REPLY / [SILENT] and the platform did not
+say that no reply was expected. Some platforms (e.g. Signal groups) cannot make
+that signal, so a deliberate silence produces a spurious warning.
+
+Add gateway.warn_on_unexpected_silence in config.yaml. The default is true,
+which keeps the upstream behaviour unchanged. Set it to false to let a bare
+silence marker stay silent on every turn. Config errors fall back to the
+default.
+---
+ gateway/response_filters.py         | 16 ++++++++++++-
+ tests/gateway/test_quiet_silence.py | 37 +++++++++++++++++++++++++++++
+ 2 files changed, 52 insertions(+), 1 deletion(-)
+ create mode 100644 tests/gateway/test_quiet_silence.py
+
+diff --git a/gateway/response_filters.py b/gateway/response_filters.py
+index 948924e832..fb7cb7b074 100644
+--- a/gateway/response_filters.py
++++ b/gateway/response_filters.py
+@@ -123,9 +123,23 @@ def is_machinery_display_kind(display_kind: Any) -> bool:
+     return display_kind in MACHINERY_DISPLAY_KINDS
+ 
+ 
++def _warn_on_unexpected_silence() -> bool:
++    """Config ``gateway.warn_on_unexpected_silence`` (default True = upstream behaviour).
++
++    When set to False, a bare silence marker (NO_REPLY / [SILENT]) stays silent on every turn and no
++    "model returned only a silence marker" warning is sent. Any config error falls back to the default
++    (True), so behaviour only changes when the flag is explicitly set to false."""
++    try:
++        from gateway.run import _load_gateway_config
++        gw = (_load_gateway_config() or {}).get("gateway")
++        return not (isinstance(gw, dict) and gw.get("warn_on_unexpected_silence") is False)
++    except Exception:
++        return True
++
++
+ def silence_allowed(display_kind: Any, reply_expected: Optional[bool] = None) -> bool:
+     """Whether a successful bare silence marker may remain silent for this turn."""
+-    return is_machinery_display_kind(display_kind) or reply_expected is False
++    return is_machinery_display_kind(display_kind) or reply_expected is False or not _warn_on_unexpected_silence()
+ 
+ 
+ def reply_expected_metadata(reply_expected: Optional[bool]) -> dict:
+diff --git a/tests/gateway/test_quiet_silence.py b/tests/gateway/test_quiet_silence.py
+new file mode 100644
+index 0000000000..a44434ac53
+--- /dev/null
++++ b/tests/gateway/test_quiet_silence.py
+@@ -0,0 +1,37 @@
++"""gateway.warn_on_unexpected_silence: default keeps upstream behaviour, ``false`` makes bare silence markers quiet."""
++import gateway.response_filters as rf
++
++
++def _cfg(monkeypatch, cfg):
++    import gateway.run as run
++    monkeypatch.setattr(run, "_load_gateway_config", lambda *a, **k: cfg)
++
++
++def test_default_keeps_upstream_behaviour(monkeypatch):
++    _cfg(monkeypatch, {})
++    assert rf.silence_allowed(None, None) is False
++    assert rf.silence_allowed(None, True) is False
++    assert rf.silence_allowed(None, False) is True
++    assert rf.silence_allowed("internal_notification", None) is True
++
++
++def test_explicit_true_keeps_upstream_behaviour(monkeypatch):
++    _cfg(monkeypatch, {"gateway": {"warn_on_unexpected_silence": True}})
++    assert rf.silence_allowed(None, None) is False
++    assert rf.silence_allowed(None, True) is False
++
++
++def test_false_makes_silence_quiet(monkeypatch):
++    _cfg(monkeypatch, {"gateway": {"warn_on_unexpected_silence": False}})
++    assert rf.silence_allowed(None, None) is True
++    assert rf.silence_allowed(None, True) is True
++
++
++def test_config_error_keeps_upstream_behaviour(monkeypatch):
++    import gateway.run as run
++
++    def boom(*a, **k):
++        raise RuntimeError("x")
++
++    monkeypatch.setattr(run, "_load_gateway_config", boom)
++    assert rf.silence_allowed(None, None) is False
+-- 
+2.43.0
+

@@ -1,0 +1,306 @@
+From e5af7520467076f75d3db76d4a0234722c56e79a Mon Sep 17 00:00:00 2001
+From: ZetOmega <70434161+ZetOmega@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 17:33:05 +0200
+Subject: [PATCH] signal: [[react:<emoji>]] replies become reactions
+ (extra.auto_react)
+
+Let the agent answer with a Signal reaction instead of (or besides) text.
+
+With platforms.signal.extra.auto_react: true, a reply starting with
+[[react:<emoji>]] is sent as a reaction on the triggering message; any text
+after the token is still sent as a normal message. The token is always
+stripped so it can never leak into a chat; invalid tokens (not an emoji) or
+auto_react off are dropped. Also adds add_reaction() so
+send_message(action="react") works on Signal, and the agent's own reaction is
+not overwritten by the final check-mark/cross outcome reaction.
+
+Env fallback: SIGNAL_AUTO_REACT.
+---
+ gateway/platforms/signal.py             |  61 ++++++++++
+ tests/gateway/test_signal_auto_react.py | 153 ++++++++++++++++++++++++
+ 2 files changed, 214 insertions(+)
+ create mode 100644 tests/gateway/test_signal_auto_react.py
+
+diff --git a/gateway/platforms/signal.py b/gateway/platforms/signal.py
+index 800f7e976d..fa1f0e7d68 100644
+--- a/gateway/platforms/signal.py
++++ b/gateway/platforms/signal.py
+@@ -9,6 +9,7 @@ import json
+ import logging
+ import os
+ import random
++import re
+ import shutil
+ import subprocess
+ import tempfile
+@@ -63,6 +64,9 @@ _SKIP_IMAGE_LOG = {
+     "oversize": lambda url, detail: ("Signal: image too large (%d bytes), skipping %s", detail, url)}
+ _QUOTE_AUTHOR_KEYS = (
+     "author", "authorNumber", "authorUuid", "authorAci", "authorServiceId", "authorServiceIdString")
++# Reaction-instead-of-text: a reply that starts with ``[[react:<emoji>]]`` becomes a Signal reaction on the
++# triggering message (any text after the token is still sent as a normal message).
++_REACT_TOKEN_RE = re.compile(r"^\s*\[\[react:\s*([^\[\]\s]{1,16})\s*\]\]\s*")
+ # Outbound quote-replies (signal-cli ``send`` quoteTimestamp/quoteAuthor/quoteMessage).
+ _QUOTE_POLICIES = ("groups", "always", "never")
+ _QUOTE_PREVIEW_MAX = 200  # chars of the quoted message echoed as quoteMessage
+@@ -160,6 +164,20 @@ def _parse_quote_policy(value: Any) -> str:
+     return key
+ 
+ 
++def _split_react_token(content: str) -> tuple[Optional[str], str]:
++    """Split a leading ``[[react:<token>]]`` off *content*: ``(token | None, remaining text)``.
++
++    The token is always removed so the marker can never leak into a chat.
++    """
++    match = _REACT_TOKEN_RE.match(content or "")
++    return (match.group(1), content[match.end():]) if match else (None, content)
++
++
++def _is_reaction_emoji(token: str) -> bool:
++    """A plausible emoji: short, and free of ASCII letters/digits (rejects ``[[react:thumbsup]]``)."""
++    return bool(token) and len(token) <= 16 and not re.search(r"[A-Za-z0-9]", token)
++
++
+ def _is_signal_service_id(value: str) -> bool:
+     """Return True if *value* already looks like a Signal service identifier (PNI:/u: prefix or UUID)."""
+     if not value:
+@@ -222,6 +240,10 @@ class SignalAdapter(BasePlatformAdapter):
+         # the reply answers an older message than the chat's latest; "always"; "never".
+         self.quote_replies = _parse_quote_policy(
+             extra["quote_replies"] if "quote_replies" in extra else _sig_secret("SIGNAL_QUOTE_REPLIES", "") or None)
++        # auto_react: let the agent answer with a reaction instead of text via a leading ``[[react:<emoji>]]``.
++        _ar_cfg = extra.get("auto_react")
++        self.auto_react = (bool(_ar_cfg) if _ar_cfg is not None
++                           else (_sig_secret("SIGNAL_AUTO_REACT", "false") or "false").lower() in TRUTHY_STRINGS)
+         self.client: Optional[httpx.AsyncClient] = None
+         self._sse_task: Optional[asyncio.Task] = None
+         self._health_monitor_task: Optional[asyncio.Task] = None
+@@ -247,6 +269,8 @@ class SignalAdapter(BasePlatformAdapter):
+         self._inbound_by_ts: OrderedDict[str, tuple[str, str]] = OrderedDict()
+         self._max_inbound_by_ts = 512
+         self._last_inbound_ts_by_chat: dict[str, str] = {}
++        # (chat_id, inbound ts) the agent already reacted to: the ✅/❌ completion swap must not overwrite it.
++        self._agent_reacted: OrderedDict[tuple[str, str], None] = OrderedDict()
+         # Best-effort number↔ACI/PNI UUID mapping so sends can upgrade a number to the UUID signal-cli prefers.
+         self._recipient_uuid_by_number: dict[str, str] = {}
+         self._recipient_number_by_uuid: dict[str, str] = {}
+@@ -773,6 +797,13 @@ class SignalAdapter(BasePlatformAdapter):
+                    metadata: Optional[dict[str, Any]] = None) -> SendResult:
+         """Send a text message with native Signal formatting."""
+         await self._stop_typing_indicator(chat_id)
++        token, content = _split_react_token(content)
++        if token is not None:
++            if self.auto_react and _is_reaction_emoji(token):
++                if not await self._react_to_trigger(chat_id, token, reply_to):
++                    logger.warning("[Signal] Reaction %s could not be delivered to %s", token, chat_id)
++            else:
++                logger.warning("[Signal] Dropped [[react:%s]] (auto_react off or not an emoji)", token)
+         if not content or not content.strip():
+             return SendResult(success=True, message_id=None)
+         base_params = await self._with_target({"account": self.account}, chat_id)
+@@ -1015,6 +1046,34 @@ class SignalAdapter(BasePlatformAdapter):
+             logger.debug("Signal: sendReaction failed (chat=%s, emoji=%s)", chat_id[:20], emoji)
+         return ok
+ 
++    def _remember_agent_reaction(self, chat_id: str, timestamp: Any) -> None:
++        """Note that the agent reacted to inbound *timestamp* (bounded) so the completion ✅/❌ leaves it alone."""
++        key = (chat_id, str(timestamp))
++        self._agent_reacted.pop(key, None)
++        self._agent_reacted[key] = None
++        while len(self._agent_reacted) > self._max_inbound_by_ts:
++            self._agent_reacted.popitem(last=False)
++
++    async def _react_to_trigger(self, chat_id: str, emoji: str, message_id: Optional[str] = None) -> bool:
++        """React with *emoji* to inbound message *message_id* (its timestamp), default the chat's newest inbound."""
++        ts = str(message_id) if message_id and str(message_id) in self._inbound_by_ts else None
++        ts = ts or self._last_inbound_ts_by_chat.get(chat_id)
++        known = self._inbound_by_ts.get(ts) if ts else None
++        if not known:
++            return False
++        ok = await self.send_reaction(chat_id, emoji, known[0], int(ts))
++        if ok:
++            self._remember_agent_reaction(chat_id, ts)
++        return ok
++
++    async def add_reaction(self, chat_id: str, emoji: str, message_id: Optional[str] = None) -> dict[str, Any]:
++        """``send_message(action="react")`` entry point; without *message_id* targets the chat's newest inbound."""
++        if not _is_reaction_emoji(emoji or ""):
++            return {"success": False, "error": f"Not an emoji: {emoji!r}"}
++        if not await self._react_to_trigger(chat_id, emoji, message_id):
++            return {"success": False, "error": "No known message to react to"}
++        return {"success": True}
++
+     async def remove_reaction(self, chat_id: str, target_author: str, target_timestamp: int) -> bool:
+         """Remove a reaction by sending an empty-string emoji."""
+         return await self._send_reaction_rpc(chat_id, {
+@@ -1046,6 +1105,8 @@ class SignalAdapter(BasePlatformAdapter):
+             return
+         if not (target := self._extract_reaction_target(event)):
+             return
++        if (event.source.chat_id, str(target[1])) in self._agent_reacted:
++            return  # the agent's own reaction replaced the 👀; a ✅ would overwrite it
+         await self.remove_reaction(event.source.chat_id, *target)
+         if emoji := _OUTCOME_REACTION.get(outcome):
+             await self.send_reaction(event.source.chat_id, emoji, *target)
+diff --git a/tests/gateway/test_signal_auto_react.py b/tests/gateway/test_signal_auto_react.py
+new file mode 100644
+index 0000000000..81c55dce7a
+--- /dev/null
++++ b/tests/gateway/test_signal_auto_react.py
+@@ -0,0 +1,153 @@
++"""Tests for agent reactions instead of text (platforms.signal.extra.auto_react, ``[[react:<emoji>]]``)."""
++import pytest
++
++from gateway.config import PlatformConfig
++from gateway.platforms.event import MessageEvent, ProcessingOutcome
++
++GROUP = "group:abc123=="
++DM = "+15550001111"
++
++
++@pytest.fixture(autouse=True)
++def _reset_signal_scheduler():
++    from gateway.platforms.signal_rate_limit import _reset_scheduler
++    _reset_scheduler()
++    yield
++    _reset_scheduler()
++
++
++def _adapter(monkeypatch, **extra):
++    monkeypatch.setenv("SIGNAL_GROUP_ALLOWED_USERS", "*")
++    monkeypatch.delenv("SIGNAL_AUTO_REACT", raising=False)
++    from gateway.platforms.signal import SignalAdapter
++    config = PlatformConfig()
++    config.enabled = True
++    config.extra = {"http_url": "http://localhost:8080", "account": "+15559998888", **extra}
++    return SignalAdapter(config)
++
++
++def _capture_rpc(adapter):
++    calls = []
++
++    async def rpc(method, params, rpc_id=None, **kwargs):
++        calls.append({"method": method, "params": dict(params)})
++        return {"timestamp": 1700000000000 + len(calls)} if method == "send" else {}
++
++    adapter._rpc = rpc
++    return calls
++
++
++def _out(calls):
++    """Outbound messages/reactions only (ignores the sendTyping stop / contact lookups around them)."""
++    return [c for c in calls if c["method"] in ("send", "sendReaction")]
++
++
++class TestTokenParsing:
++    @pytest.mark.parametrize("text,token,rest", [
++        ("[[react:👍]]", "👍", ""),
++        ("  [[react: ❤️ ]] thank you", "❤️", "thank you"),
++        ("[[react:👍🏽]]\nok", "👍🏽", "ok"),
++        ("no token [[react:👍]]", None, "no token [[react:👍]]"),
++        ("plain", None, "plain")])
++    def test_split(self, text, token, rest):
++        from gateway.platforms.signal import _split_react_token
++        assert _split_react_token(text) == (token, rest)
++
++    def test_emoji_validation(self):
++        from gateway.platforms.signal import _is_reaction_emoji
++        assert _is_reaction_emoji("👍") and _is_reaction_emoji("❤️")
++        assert not _is_reaction_emoji("thumbsup") and not _is_reaction_emoji("") and not _is_reaction_emoji("a👍")
++
++    def test_config_flag(self, monkeypatch):
++        assert _adapter(monkeypatch).auto_react is False
++        assert _adapter(monkeypatch, auto_react=True).auto_react is True
++
++
++class TestReactInsteadOfText:
++    @pytest.mark.asyncio
++    async def test_reaction_only_reply_sends_reaction_and_no_text(self, monkeypatch):
++        a = _adapter(monkeypatch, auto_react=True)
++        a._remember_inbound(GROUP, 1000, "+15550001111", "thanks!")
++        calls = _capture_rpc(a)
++        result = await a.send(GROUP, "[[react:👍]]", reply_to="1000")
++        assert result.success
++        assert [c["method"] for c in _out(calls)] == ["sendReaction"]
++        assert _out(calls)[0]["params"] == {
++            "account": "+15559998888", "emoji": "👍", "targetAuthor": "+15550001111",
++            "targetTimestamp": 1000, "groupId": "abc123=="}
++
++    @pytest.mark.asyncio
++    async def test_reaction_plus_text_sends_both(self, monkeypatch):
++        a = _adapter(monkeypatch, auto_react=True, quote_replies="never")
++        a._remember_inbound(DM, 1000, DM, "ok")
++        calls = _capture_rpc(a)
++        await a.send(DM, "[[react:✅]] done", reply_to="1000")
++        methods = [c["method"] for c in _out(calls)]
++        assert methods.count("sendReaction") == 1 and methods.count("send") == 1
++        assert [c for c in calls if c["method"] == "send"][0]["params"]["message"] == "done"
++
++    @pytest.mark.asyncio
++    async def test_falls_back_to_newest_inbound_without_anchor(self, monkeypatch):
++        a = _adapter(monkeypatch, auto_react=True)
++        a._remember_inbound(DM, 1000, DM, "a")
++        a._remember_inbound(DM, 2000, DM, "b")
++        calls = _capture_rpc(a)
++        await a.send(DM, "[[react:👍]]")
++        assert _out(calls)[0]["params"]["targetTimestamp"] == 2000
++
++    @pytest.mark.asyncio
++    async def test_disabled_or_invalid_token_is_dropped_never_sent_as_text(self, monkeypatch):
++        off = _adapter(monkeypatch)
++        off._remember_inbound(DM, 1000, DM, "x")
++        calls = _capture_rpc(off)
++        assert (await off.send(DM, "[[react:👍]]", reply_to="1000")).success
++        assert _out(calls) == []
++        on = _adapter(monkeypatch, auto_react=True)
++        on._remember_inbound(DM, 1000, DM, "x")
++        calls = _capture_rpc(on)
++        await on.send(DM, "[[react:thumbsup]]", reply_to="1000")
++        assert _out(calls) == []
++
++    @pytest.mark.asyncio
++    async def test_unknown_target_sends_nothing_and_does_not_crash(self, monkeypatch):
++        a = _adapter(monkeypatch, auto_react=True)
++        calls = _capture_rpc(a)
++        assert (await a.send(DM, "[[react:👍]]", reply_to="5")).success
++        assert _out(calls) == []
++
++    @pytest.mark.asyncio
++    async def test_add_reaction_tool_entry_point(self, monkeypatch):
++        a = _adapter(monkeypatch, auto_react=True)
++        a._remember_inbound(DM, 1000, DM, "x")
++        calls = _capture_rpc(a)
++        assert await a.add_reaction(DM, "🎉") == {"success": True}
++        assert _out(calls)[0]["params"]["targetTimestamp"] == 1000
++        assert (await a.add_reaction(DM, "nope"))["success"] is False
++        assert (await a.add_reaction("+1999", "🎉"))["success"] is False
++
++
++class TestCompletionSwap:
++    def _event(self, adapter, chat_id, ts):
++        source = adapter.build_source(chat_id=chat_id, chat_type="dm", user_id=DM, user_name="T")
++        return MessageEvent(source=source, text="x", message_id=str(ts),
++                            raw_message={"sender": DM, "timestamp_ms": ts})
++
++    @pytest.mark.asyncio
++    async def test_checkmark_does_not_overwrite_agent_reaction(self, monkeypatch):
++        a = _adapter(monkeypatch, auto_react=True)
++        a._remember_inbound(DM, 1000, DM, "thanks")
++        calls = _capture_rpc(a)
++        await a.send(DM, "[[react:👍]]", reply_to="1000")
++        calls.clear()
++        await a.on_processing_complete(self._event(a, DM, 1000), ProcessingOutcome.SUCCESS)
++        assert calls == []
++
++    @pytest.mark.asyncio
++    async def test_checkmark_still_sent_when_agent_answered_with_text(self, monkeypatch):
++        a = _adapter(monkeypatch, auto_react=True)
++        a._remember_inbound(DM, 1000, DM, "question")
++        calls = _capture_rpc(a)
++        await a.send(DM, "answer", reply_to="1000")
++        calls.clear()
++        await a.on_processing_complete(self._event(a, DM, 1000), ProcessingOutcome.SUCCESS)
++        assert [c["params"].get("emoji") for c in calls] == ["", "✅"]
+-- 
+2.43.0
+

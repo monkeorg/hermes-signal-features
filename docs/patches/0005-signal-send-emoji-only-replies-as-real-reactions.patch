@@ -1,0 +1,125 @@
+From 8fea1ad81f8ce72d1f19c2051033b12efdb03df3 Mon Sep 17 00:00:00 2001
+From: ZetOmega <70434161+ZetOmega@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 17:33:05 +0200
+Subject: [PATCH] signal: send emoji-only replies as real reactions
+
+Safety net for auto_react: a reply that consists of nothing but one short
+emoji run (e.g. a thumbs-up) and answers a known message is sent as a Signal
+reaction on that message instead of a chat message. Only active with
+platforms.signal.extra.auto_react: true; falls back to plain text if the
+reaction cannot be delivered.
+---
+ gateway/platforms/signal.py                   | 12 ++++
+ tests/gateway/test_signal_react_emoji_only.py | 70 +++++++++++++++++++
+ 2 files changed, 82 insertions(+)
+ create mode 100644 tests/gateway/test_signal_react_emoji_only.py
+
+diff --git a/gateway/platforms/signal.py b/gateway/platforms/signal.py
+index 2523641888..b3c9b95e58 100644
+--- a/gateway/platforms/signal.py
++++ b/gateway/platforms/signal.py
+@@ -194,6 +194,13 @@ def _is_reaction_emoji(token: str) -> bool:
+     return bool(token) and len(token) <= 16 and not re.search(r"[A-Za-z0-9]", token)
+ 
+ 
++def _is_bare_emoji_reply(content: str) -> bool:
++    """A reply that is nothing but one short emoji run (no letters/digits/whitespace), e.g. ``👍`` or ``😂😂``."""
++    text = (content or "").strip()
++    return (0 < len(text) <= 8 and not re.search(r"\s", text) and _is_reaction_emoji(text)
++            and any(ord(ch) >= 0x2190 for ch in text))
++
++
+ def _is_signal_service_id(value: str) -> bool:
+     """Return True if *value* already looks like a Signal service identifier (PNI:/u: prefix or UUID)."""
+     if not value:
+@@ -918,6 +925,11 @@ class SignalAdapter(BasePlatformAdapter):
+         """Send a text message with native Signal formatting."""
+         await self._stop_typing_indicator(chat_id)
+         token, content = _split_react_token(content)
++        if token is None and self.auto_react and reply_to and _is_bare_emoji_reply(content):
++            # Safety net: an emoji-only reply must be a reaction on the triggering message, never a chat message.
++            if await self._react_to_trigger(chat_id, content.strip(), reply_to):
++                return SendResult(success=True, message_id=None)
++            logger.warning("[Signal] Bare-emoji reply could not be sent as a reaction; sending as text")
+         if token is not None:
+             if self.auto_react and _is_reaction_emoji(token):
+                 if not await self._react_to_trigger(chat_id, token, reply_to):
+diff --git a/tests/gateway/test_signal_react_emoji_only.py b/tests/gateway/test_signal_react_emoji_only.py
+new file mode 100644
+index 0000000000..1c23653d07
+--- /dev/null
++++ b/tests/gateway/test_signal_react_emoji_only.py
+@@ -0,0 +1,70 @@
++"""Safety net: an emoji-only reply becomes a reaction (platforms.signal.extra.auto_react)."""
++import pytest
++
++from gateway.config import PlatformConfig
++from gateway.platforms.event import MessageEvent, ProcessingOutcome
++
++GROUP = "group:abc123=="
++DM = "+15550001111"
++
++
++@pytest.fixture(autouse=True)
++def _reset_signal_scheduler():
++    from gateway.platforms.signal_rate_limit import _reset_scheduler
++    _reset_scheduler()
++    yield
++    _reset_scheduler()
++
++
++def _adapter(monkeypatch, **extra):
++    monkeypatch.setenv("SIGNAL_GROUP_ALLOWED_USERS", "*")
++    monkeypatch.delenv("SIGNAL_AUTO_REACT", raising=False)
++    from gateway.platforms.signal import SignalAdapter
++    config = PlatformConfig()
++    config.enabled = True
++    config.extra = {"http_url": "http://localhost:8080", "account": "+15559998888", **extra}
++    return SignalAdapter(config)
++
++
++def _capture_rpc(adapter):
++    calls = []
++
++    async def rpc(method, params, rpc_id=None, **kwargs):
++        calls.append({"method": method, "params": dict(params)})
++        return {"timestamp": 1700000000000 + len(calls)} if method == "send" else {}
++
++    adapter._rpc = rpc
++    return calls
++
++
++def _out(calls):
++    """Outbound messages/reactions only (ignores the sendTyping stop / contact lookups around them)."""
++    return [c for c in calls if c["method"] in ("send", "sendReaction")]
++
++class TestBareEmojiSafetyNet:
++    @pytest.mark.parametrize("text,ok", [("👍", True), ("  😂 \n", True), ("❤️", True), ("👍🏽", True),
++                                         ("ok", False), ("👍 ok", False), (":)", False), ("...", False), ("", False)])
++    def test_detect(self, text, ok):
++        from gateway.platforms.signal import _is_bare_emoji_reply
++        assert _is_bare_emoji_reply(text) is ok
++
++    @pytest.mark.asyncio
++    async def test_bare_emoji_with_reply_to_becomes_reaction(self, monkeypatch):
++        a = _adapter(monkeypatch, auto_react=True)
++        a._remember_inbound(GROUP, 1000, "+15550001111", "thanks!")
++        calls = _capture_rpc(a)
++        result = await a.send(GROUP, "👍", reply_to="1000")
++        assert result.success
++        assert [c["method"] for c in _out(calls)] == ["sendReaction"]
++
++    @pytest.mark.asyncio
++    async def test_bare_emoji_without_reply_to_or_flag_stays_text(self, monkeypatch):
++        a = _adapter(monkeypatch, auto_react=True)
++        calls = _capture_rpc(a)
++        await a.send(GROUP, "👍")
++        assert [c["method"] for c in _out(calls)] == ["send"]
++        b = _adapter(monkeypatch)
++        b._remember_inbound(GROUP, 1000, "+15550001111", "x")
++        calls = _capture_rpc(b)
++        await b.send(GROUP, "👍", reply_to="1000")
++        assert [c["method"] for c in _out(calls)] == ["send"]
+-- 
+2.43.0
+

@@ -1,0 +1,430 @@
+From bc2de87d3d3de6ad161f5347f8d37941591205ad Mon Sep 17 00:00:00 2001
+From: ZetOmega <70434161+ZetOmega@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 17:33:05 +0200
+Subject: [PATCH] signal: turn @Name in group replies into real mentions
+ (extra.real_mentions)
+
+Turn "@Name" in outgoing group messages into real Signal mentions.
+
+platforms.signal.extra.real_mentions: true enables it. Names resolve via
+platforms.signal.extra.mention_aliases ({name: number-or-uuid}), then via the
+group's members matched against contact-book names and the profile names of
+people seen in chat. Ambiguous names are skipped unless the person being
+replied to disambiguates; non-members and the bot itself are never mentioned;
+code spans/blocks and e-mail addresses are left alone. Offsets are computed in
+UTF-16 units. If signal-cli rejects a mention, the message is resent as plain
+"@Name" text.
+
+Env fallback: SIGNAL_REAL_MENTIONS.
+---
+ gateway/platforms/signal.py                | 127 ++++++++++++
+ tests/gateway/test_signal_real_mentions.py | 224 +++++++++++++++++++++
+ 2 files changed, 351 insertions(+)
+ create mode 100644 tests/gateway/test_signal_real_mentions.py
+
+diff --git a/gateway/platforms/signal.py b/gateway/platforms/signal.py
+index fa1f0e7d68..2523641888 100644
+--- a/gateway/platforms/signal.py
++++ b/gateway/platforms/signal.py
+@@ -152,6 +152,22 @@ def _render_mentions(text: str, mentions: list) -> str:
+     return text
+ 
+ 
++# Outbound "@Name" -> real Signal mention (platforms.signal.extra.real_mentions).
++_MENTION_TOKEN_RE = re.compile(r"(?<![\w@+])@([^\W\d_](?:[\w.\-]*\w)?)")
++_MENTION_CACHE_TTL = 600.0  # seconds a group member list / contact book is reused
++_MENTION_MAX_NAMES = 512
++
++
++def _mention_name_keys(*names: Any) -> list[str]:
++    """Casefolded first word of each display name ("Charlie M." -> "charlie"): what an "@Charlie" token can match."""
++    keys: list[str] = []
++    for name in names:
++        parts = name.split() if isinstance(name, str) else ()
++        if parts and (key := parts[0].strip("@.,:;!?").casefold()) and key not in keys:
++            keys.append(key)
++    return keys
++
++
+ def _parse_quote_policy(value: Any) -> str:
+     """Normalise ``quote_replies`` (groups | always | never; YAML booleans accepted) to a policy name."""
+     if value is None or value == "":
+@@ -244,6 +260,19 @@ class SignalAdapter(BasePlatformAdapter):
+         _ar_cfg = extra.get("auto_react")
+         self.auto_react = (bool(_ar_cfg) if _ar_cfg is not None
+                            else (_sig_secret("SIGNAL_AUTO_REACT", "false") or "false").lower() in TRUTHY_STRINGS)
++        # real_mentions: turn "@Name" in outgoing *group* text into a real Signal mention (signal-cli ``mention``
++        # param, "start:length:id"). Names resolve via ``mention_aliases`` ({name: number-or-uuid}), then the group's
++        # members matched against contact names and the profile names of people seen in chat.
++        _rm = extra.get("real_mentions")
++        self.real_mentions = (bool(_rm) if _rm is not None
++                              else (_sig_secret("SIGNAL_REAL_MENTIONS", "false") or "false").lower() in TRUTHY_STRINGS)
++        _aliases = extra.get("mention_aliases")
++        self._mention_aliases: dict[str, str] = {
++            str(k).strip().lstrip("@").casefold(): str(v).strip()
++            for k, v in (_aliases.items() if isinstance(_aliases, dict) else ()) if k and v}
++        self._mention_names: dict[str, set[str]] = {}  # first name (casefolded) -> sender/contact ids
++        self._mention_contacts_at = 0.0
++        self._group_members: dict[str, tuple[float, set[str]]] = {}
+         self.client: Optional[httpx.AsyncClient] = None
+         self._sse_task: Optional[asyncio.Task] = None
+         self._health_monitor_task: Optional[asyncio.Task] = None
+@@ -482,6 +511,8 @@ class SignalAdapter(BasePlatformAdapter):
+         sender_name = envelope_data.get("sourceName", "")
+         sender_uuid = envelope_data.get("sourceUuid", "")
+         self._remember_recipient_identifiers(sender, sender_uuid)
++        if self.real_mentions and sender and sender != self._account_normalized:
++            self._learn_mention_name(sender_name, sender, sender_uuid)
+         if not sender:
+             logger.debug("Signal: ignoring envelope with no sender")
+             return
+@@ -666,6 +697,95 @@ class SignalAdapter(BasePlatformAdapter):
+             params["recipient"] = [await self._resolve_recipient(chat_id) if resolve else chat_id]
+         return params
+ 
++    def _learn_mention_name(self, display_name: Any, *ids: Any) -> None:
++        """Remember that the first word of *display_name* may denote any of *ids* (number and/or UUID)."""
++        ident = {str(i) for i in ids if i and str(i) != self._account_normalized}
++        for key in _mention_name_keys(display_name) if ident else ():
++            self._mention_names.setdefault(key, set()).update(ident)
++            if len(self._mention_names) > _MENTION_MAX_NAMES:
++                self._mention_names.pop(next(iter(self._mention_names)))
++
++    async def _refresh_mention_contacts(self) -> None:
++        """Load contact-book names (given/nick/profile/full name) into the name map, at most every TTL."""
++        if time.monotonic() - self._mention_contacts_at < _MENTION_CACHE_TTL:
++            return
++        self._mention_contacts_at = time.monotonic()
++        contacts = await self._rpc("listContacts", {"account": self.account}, log_failures=False)
++        for contact in contacts if isinstance(contacts, list) else ():
++            if not isinstance(contact, dict):
++                continue
++            profile = contact.get("profile") if isinstance(contact.get("profile"), dict) else {}
++            self._remember_recipient_identifiers(contact.get("number"), contact.get("uuid"))
++            self._learn_mention_name(contact.get("nickName") or contact.get("nickGivenName"),
++                                     contact.get("number"), contact.get("uuid"))
++            for name in (contact.get("givenName"), profile.get("givenName"), contact.get("name")):
++                self._learn_mention_name(name, contact.get("number"), contact.get("uuid"))
++
++    async def _group_member_ids(self, chat_id: str) -> Optional[set[str]]:
++        """Numbers and UUIDs of the group's members (cached), or None when signal-cli could not tell."""
++        cached = self._group_members.get(chat_id)
++        if cached and time.monotonic() - cached[0] < _MENTION_CACHE_TTL:
++            return cached[1]
++        groups = await self._rpc("listGroups", {"account": self.account, "groupId": chat_id[6:]}, log_failures=False)
++        group = next((g for g in groups if isinstance(g, dict) and g.get("id") == chat_id[6:]), None) \
++            if isinstance(groups, list) else None
++        if not group:
++            return None
++        ids: set[str] = set()
++        for member in group.get("members") or ():
++            if isinstance(member, dict):
++                self._remember_recipient_identifiers(member.get("number"), member.get("uuid"))
++                ids.update(str(v) for v in (member.get("number"), member.get("uuid")) if v)
++        self._group_members[chat_id] = (time.monotonic(), ids)
++        return ids
++
++    def _same_person(self, a: str, b: str) -> bool:
++        return a == b or self._recipient_uuid_by_number.get(a) == b or self._recipient_uuid_by_number.get(b) == a
++
++    def _mention_target(self, name: str, members: Optional[set[str]], prefer: Optional[str]) -> Optional[str]:
++        """Signal id (UUID when known, else number) for "@name", or None if unknown/ambiguous/not in the group."""
++        key = name.casefold()
++        if alias := self._mention_aliases.get(key):
++            candidates = {alias}
++        else:
++            candidates = set(self._mention_names.get(key, ()))
++        if members is not None:
++            candidates = {c for c in candidates if any(self._same_person(c, m) for m in members)}
++        if prefer and len(candidates) > 1:  # several people share the name: the person being replied to wins
++            candidates = {c for c in candidates if self._same_person(c, prefer)} or candidates
++        people: list[str] = []
++        for cand in sorted(candidates):
++            if not any(self._same_person(cand, seen) for seen in people):
++                people.append(cand)
++        if len(people) != 1 or self._same_person(people[0], self._account_normalized):
++            return None
++        return self._recipient_uuid_by_number.get(people[0], people[0])
++
++    async def _mention_params(self, chat_id: str, plain_text: str, text_styles: list[str],
++                              reply_to: Optional[str]) -> list[str]:
++        """signal-cli ``mention`` entries ("start:length:id", UTF-16 units) for the "@Name" tokens in *plain_text*.
++        The text stays as written: Signal clients draw the mention over the given range."""
++        if not (self.real_mentions and chat_id.startswith("group:") and "@" in plain_text):
++            return []
++        mono: list[tuple[int, int]] = []
++        for style in text_styles:
++            with suppress(ValueError):
++                start, length, kind = style.split(":", 2)
++                if kind == "MONOSPACE":
++                    mono.append((int(start), int(start) + int(length)))
++        tokens = [m for m in _MENTION_TOKEN_RE.finditer(plain_text)
++                  if not any(a <= utf16_len(plain_text[:m.start()]) < b for a, b in mono)]
++        if not tokens:
++            return []
++        await self._refresh_mention_contacts()
++        members = await self._group_member_ids(chat_id)
++        prefer = (self._inbound_by_ts.get(str(reply_to)) or (None,))[0] if reply_to else None
++        mentions: list[str] = []
++        for m in tokens:
++            if target := self._mention_target(m.group(1), members, prefer):
++                mentions.append(f"{utf16_len(plain_text[:m.start()])}:{utf16_len(m.group(0))}:{target}")
++        return mentions
++
+     async def _fetch_attachment(self, attachment_id: str) -> tuple:
+         """Fetch an attachment via JSON-RPC and cache it. Returns (path, ext)."""
+         result = await self._rpc("getAttachment", {"account": self.account, "id": attachment_id})
+@@ -814,6 +934,8 @@ class SignalAdapter(BasePlatformAdapter):
+             params: dict[str, Any] = dict(base_params, message=plain_text)
+             if idx == 1 and quote:
+                 params.update(quote)
++            if mentions := await self._mention_params(chat_id, plain_text, text_styles, reply_to):
++                params["mention"] = mentions
+             if len(text_styles) == 1:
+                 params["textStyle"] = text_styles[0]
+             elif text_styles:
+@@ -827,6 +949,11 @@ class SignalAdapter(BasePlatformAdapter):
+                 for key in quote:
+                     params.pop(key, None)
+                 last_result, err = await self._rpc_send(params, "RPC send failed")
++            if err and params.get("mention"):
++                # A mention signal-cli rejects must never cost the message: resend as plain "@Name" text.
++                logger.warning("[Signal] Send with mentions failed (%s); retrying without mentions", err.error)
++                params.pop("mention")
++                last_result, err = await self._rpc_send(params, "RPC send failed")
+             if err:
+                 return err
+         # No editable message identifier; message_id=None keeps the stream consumer on the non-edit path.
+diff --git a/tests/gateway/test_signal_real_mentions.py b/tests/gateway/test_signal_real_mentions.py
+new file mode 100644
+index 0000000000..5e7a33771d
+--- /dev/null
++++ b/tests/gateway/test_signal_real_mentions.py
+@@ -0,0 +1,224 @@
++"""Tests for real Signal @mentions in outgoing group text (platforms.signal.extra.real_mentions)."""
++import asyncio
++
++import pytest
++
++from gateway.config import PlatformConfig
++
++GROUP = "group:abc123=="
++GID = "abc123=="
++DM = "+15550001111"
++BOT = "+15559998888"
++CHARLIE, CHARLIE_UUID = "+15550001111", "11111111-1111-4111-8111-111111111111"
++ALICE, ALICE_UUID = "+15550002222", "22222222-2222-4222-8222-222222222222"
++OUTSIDER_UUID = "33333333-3333-4333-8333-333333333333"
++
++
++@pytest.fixture(autouse=True)
++def _reset_signal_scheduler():
++    from gateway.platforms.signal_rate_limit import _reset_scheduler
++    _reset_scheduler()
++    yield
++    _reset_scheduler()
++
++
++def _adapter(monkeypatch, **extra):
++    monkeypatch.setenv("SIGNAL_GROUP_ALLOWED_USERS", "*")
++    monkeypatch.delenv("SIGNAL_REAL_MENTIONS", raising=False)
++    from gateway.platforms.signal import SignalAdapter
++    config = PlatformConfig()
++    config.enabled = True
++    config.extra = {"http_url": "http://localhost:8080", "account": BOT, "real_mentions": True, **extra}
++    return SignalAdapter(config)
++
++
++def _rpc_stub(adapter, members=None, contacts=None, reject_mentions=False, reject_quote=False):
++    calls = []
++    members = [{"number": CHARLIE, "uuid": CHARLIE_UUID}, {"number": ALICE, "uuid": ALICE_UUID},
++               {"number": BOT, "uuid": "99999999-9999-4999-8999-999999999999"}] if members is None else members
++
++    async def rpc(method, params, rpc_id=None, **kwargs):
++        calls.append({"method": method, "params": dict(params)})
++        if method == "listGroups":
++            return None if members is False else [{"id": GID, "name": "g", "members": members}]
++        if method == "listContacts":
++            return contacts or []
++        if method == "send":
++            if reject_mentions and "mention" in params or reject_quote and "quoteTimestamp" in params:
++                return None
++            return {"timestamp": 1700000000000 + len(calls)}
++        return None
++
++    adapter._rpc = rpc
++    return calls
++
++
++def _sends(calls):
++    return [c["params"] for c in calls if c["method"] == "send"]
++
++
++def _send(adapter, text, chat=GROUP, reply_to=None):
++    return asyncio.run(adapter.send(chat, text, reply_to=reply_to))
++
++
++class TestConfig:
++    def test_default_off_and_keys(self, monkeypatch):
++        from gateway.platforms.signal import SignalAdapter
++        a = _adapter(monkeypatch, real_mentions=None)
++        assert a.real_mentions is False
++        assert _adapter(monkeypatch).real_mentions is True
++        b = _adapter(monkeypatch, mention_aliases={"@Charlie": CHARLIE, "": "x", "Bad": None})
++        assert b._mention_aliases == {"charlie": CHARLIE}
++        assert isinstance(a, SignalAdapter)
++
++    def test_env_fallback(self, monkeypatch):
++        a = _adapter(monkeypatch, real_mentions=None)
++        monkeypatch.setenv("SIGNAL_REAL_MENTIONS", "true")
++        from gateway.platforms.signal import SignalAdapter
++        cfg = PlatformConfig()
++        cfg.extra = {"http_url": "http://x", "account": BOT}
++        assert SignalAdapter(cfg).real_mentions is True
++
++
++class TestPayload:
++    def test_alias_becomes_mention_param(self, monkeypatch):
++        a = _adapter(monkeypatch, mention_aliases={"charlie": CHARLIE})
++        calls = _rpc_stub(a)
++        res = _send(a, "Hello @Charlie, done.")
++        assert res.success
++        (params,) = _sends(calls)
++        # text untouched; mention covers "@Charlie" (start 6, length 8) and uses the member's UUID
++        assert params["message"] == "Hello @Charlie, done."
++        assert params["mention"] == [f"6:8:{CHARLIE_UUID}"]
++        assert params["groupId"] == GID
++
++    def test_no_mentions_in_dm_or_when_disabled(self, monkeypatch):
++        a = _adapter(monkeypatch, mention_aliases={"charlie": CHARLIE})
++        calls = _rpc_stub(a)
++        _send(a, "Hi @Charlie", chat=DM)
++        assert "mention" not in _sends(calls)[0]
++        assert not [c for c in calls if c["method"] == "listGroups"]
++        off = _adapter(monkeypatch, real_mentions=False, mention_aliases={"charlie": CHARLIE})
++        calls = _rpc_stub(off)
++        _send(off, "Hi @Charlie")
++        assert "mention" not in _sends(calls)[0]
++
++    def test_utf16_offsets_with_emoji_and_two_mentions(self, monkeypatch):
++        a = _adapter(monkeypatch, mention_aliases={"charlie": CHARLIE, "alice": ALICE_UUID})
++        calls = _rpc_stub(a)
++        _send(a, "😀 @Charlie and @Alice!")
++        (params,) = _sends(calls)
++        # the emoji is 2 UTF-16 units: "@Charlie" starts at 3, "@Alice" at 3+8+5=16
++        assert params["mention"] == [f"3:8:{CHARLIE_UUID}", f"16:6:{ALICE_UUID}"]
++
++    def test_unknown_name_email_and_code_are_left_alone(self, monkeypatch):
++        a = _adapter(monkeypatch, mention_aliases={"charlie": CHARLIE})
++        calls = _rpc_stub(a)
++        _send(a, "mail me@example.com, @Nobody and `@Charlie` stay plain")
++        assert "mention" not in _sends(calls)[0]
++        calls = _rpc_stub(a)
++        a._group_members.clear()
++        _send(a, "```\n@Charlie\n```")
++        assert "mention" not in _sends(calls)[0]
++
++    def test_non_member_is_not_mentioned(self, monkeypatch):
++        a = _adapter(monkeypatch, mention_aliases={"mallory": OUTSIDER_UUID, "charlie": CHARLIE})
++        calls = _rpc_stub(a)
++        _send(a, "@Mallory and @Charlie")
++        assert _sends(calls)[0]["mention"] == [f"13:8:{CHARLIE_UUID}"]
++
++    def test_bot_itself_is_never_mentioned(self, monkeypatch):
++        a = _adapter(monkeypatch, mention_aliases={"chatbot": BOT})
++        calls = _rpc_stub(a)
++        _send(a, "I am @Chatbot")
++        assert "mention" not in _sends(calls)[0]
++
++    def test_member_list_unavailable_still_sends_alias_mention(self, monkeypatch):
++        a = _adapter(monkeypatch, mention_aliases={"charlie": CHARLIE_UUID})
++        calls = _rpc_stub(a, members=False)
++        _send(a, "@Charlie")
++        assert _sends(calls)[0]["mention"] == [f"0:8:{CHARLIE_UUID}"]
++
++
++class TestNameResolution:
++    def test_contact_and_seen_sender_names(self, monkeypatch):
++        a = _adapter(monkeypatch)
++        contacts = [{"number": ALICE, "uuid": ALICE_UUID, "givenName": "Alice", "name": "Alice Example",
++                     "profile": {"givenName": "Alice"}}]
++        calls = _rpc_stub(a, contacts=contacts)
++        a._learn_mention_name("Charlie M.", CHARLIE, CHARLIE_UUID)  # as inbound envelopes do
++        _send(a, "@alice, @charlie")
++        assert _sends(calls)[0]["mention"] == [f"0:6:{ALICE_UUID}", f"8:8:{CHARLIE_UUID}"]
++
++    def test_alias_beats_learned_name(self, monkeypatch):
++        a = _adapter(monkeypatch, mention_aliases={"charlie": CHARLIE})
++        a._learn_mention_name("Charlie", ALICE, ALICE_UUID)
++        calls = _rpc_stub(a)
++        _send(a, "@Charlie")
++        assert _sends(calls)[0]["mention"] == [f"0:8:{CHARLIE_UUID}"]
++
++    def test_ambiguous_name_is_skipped_unless_reply_target_decides(self, monkeypatch):
++        a = _adapter(monkeypatch)
++        a._learn_mention_name("Alex", CHARLIE, CHARLIE_UUID)
++        a._learn_mention_name("Alex", ALICE, ALICE_UUID)
++        calls = _rpc_stub(a)
++        _send(a, "@Alex")
++        assert "mention" not in _sends(calls)[0]
++        a._remember_inbound(GROUP, 1000, ALICE, "hi")
++        _send(a, "@Alex", reply_to="1000")
++        assert _sends(calls)[1]["mention"] == [f"0:5:{ALICE_UUID}"]
++
++    def test_sender_of_inbound_envelope_is_learned(self, monkeypatch):
++        a = _adapter(monkeypatch)
++        asyncio.run(a._handle_envelope({"envelope": {
++            "sourceNumber": ALICE, "sourceUuid": ALICE_UUID, "sourceName": "Alice K", "timestamp": 1,
++            "dataMessage": {"message": "x", "groupInfo": {"groupId": "other=="}}}}))
++        assert a._mention_names["alice"] == {ALICE, ALICE_UUID}
++
++
++class TestChunksAndFallbacks:
++    def test_mentions_are_chunk_local(self, monkeypatch):
++        a = _adapter(monkeypatch, mention_aliases={"charlie": CHARLIE})
++        a.MAX_MESSAGE_LENGTH = 40
++        calls = _rpc_stub(a)
++        _send(a, "x" * 45 + " @Charlie ok")
++        sends = _sends(calls)
++        assert len(sends) == 2
++        assert "mention" not in sends[0]
++        start = sends[1]["message"].index("@Charlie")
++        assert sends[1]["mention"] == [f"{start}:8:{CHARLIE_UUID}"]
++
++    def test_rejected_mention_falls_back_to_plain_text(self, monkeypatch):
++        a = _adapter(monkeypatch, mention_aliases={"charlie": CHARLIE})
++        calls = _rpc_stub(a, reject_mentions=True)
++        res = _send(a, "@Charlie hi")
++        assert res.success
++        first, second = _sends(calls)
++        assert "mention" in first and "mention" not in second and second["message"] == "@Charlie hi"
++
++    def test_quote_failure_keeps_mention(self, monkeypatch):
++        a = _adapter(monkeypatch, mention_aliases={"charlie": CHARLIE})
++        a._remember_inbound(GROUP, 1000, ALICE, "hi")
++        calls = _rpc_stub(a, reject_quote=True)
++        res = _send(a, "@Charlie hi", reply_to="1000")
++        assert res.success
++        first, second = _sends(calls)
++        assert "quoteTimestamp" in first and "quoteTimestamp" not in second
++        assert second["mention"] == [f"0:8:{CHARLIE_UUID}"]
++
++    def test_quote_and_text_style_coexist_with_mention(self, monkeypatch):
++        a = _adapter(monkeypatch, mention_aliases={"charlie": CHARLIE})
++        a._remember_inbound(GROUP, 1000, ALICE, "hi")
++        calls = _rpc_stub(a)
++        _send(a, "**@Charlie** done", reply_to="1000")
++        (params,) = _sends(calls)
++        assert params["quoteTimestamp"] == 1000
++        assert params["textStyle"] == "0:8:BOLD" and params["mention"] == [f"0:8:{CHARLIE_UUID}"]
++
++    def test_member_list_is_cached(self, monkeypatch):
++        a = _adapter(monkeypatch, mention_aliases={"charlie": CHARLIE})
++        calls = _rpc_stub(a)
++        _send(a, "@Charlie")
++        _send(a, "@Charlie again")
++        assert len([c for c in calls if c["method"] == "listGroups"]) == 1
++        assert len([c for c in calls if c["method"] == "listContacts"]) == 1
+-- 
+2.43.0
+
