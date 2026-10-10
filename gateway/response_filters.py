@@ -123,9 +123,23 @@ def is_machinery_display_kind(display_kind: Any) -> bool:
     return display_kind in MACHINERY_DISPLAY_KINDS
 
 
+def _warn_on_unexpected_silence() -> bool:
+    """Config ``gateway.warn_on_unexpected_silence`` (default True = upstream behaviour).
+
+    When set to False, a bare silence marker (NO_REPLY / [SILENT]) stays silent on every turn and no
+    "model returned only a silence marker" warning is sent. Any config error falls back to the default
+    (True), so behaviour only changes when the flag is explicitly set to false."""
+    try:
+        from gateway.run import _load_gateway_config
+        gw = (_load_gateway_config() or {}).get("gateway")
+        return not (isinstance(gw, dict) and gw.get("warn_on_unexpected_silence") is False)
+    except Exception:
+        return True
+
+
 def silence_allowed(display_kind: Any, reply_expected: Optional[bool] = None) -> bool:
     """Whether a successful bare silence marker may remain silent for this turn."""
-    return is_machinery_display_kind(display_kind) or reply_expected is False
+    return is_machinery_display_kind(display_kind) or reply_expected is False or not _warn_on_unexpected_silence()
 
 
 def reply_expected_metadata(reply_expected: Optional[bool]) -> dict:
