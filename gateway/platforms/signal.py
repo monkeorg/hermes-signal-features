@@ -194,6 +194,13 @@ def _is_reaction_emoji(token: str) -> bool:
     return bool(token) and len(token) <= 16 and not re.search(r"[A-Za-z0-9]", token)
 
 
+def _is_bare_emoji_reply(content: str) -> bool:
+    """A reply that is nothing but one short emoji run (no letters/digits/whitespace), e.g. ``👍`` or ``😂😂``."""
+    text = (content or "").strip()
+    return (0 < len(text) <= 8 and not re.search(r"\s", text) and _is_reaction_emoji(text)
+            and any(ord(ch) >= 0x2190 for ch in text))
+
+
 def _is_signal_service_id(value: str) -> bool:
     """Return True if *value* already looks like a Signal service identifier (PNI:/u: prefix or UUID)."""
     if not value:
@@ -918,6 +925,11 @@ class SignalAdapter(BasePlatformAdapter):
         """Send a text message with native Signal formatting."""
         await self._stop_typing_indicator(chat_id)
         token, content = _split_react_token(content)
+        if token is None and self.auto_react and reply_to and _is_bare_emoji_reply(content):
+            # Safety net: an emoji-only reply must be a reaction on the triggering message, never a chat message.
+            if await self._react_to_trigger(chat_id, content.strip(), reply_to):
+                return SendResult(success=True, message_id=None)
+            logger.warning("[Signal] Bare-emoji reply could not be sent as a reaction; sending as text")
         if token is not None:
             if self.auto_react and _is_reaction_emoji(token):
                 if not await self._react_to_trigger(chat_id, token, reply_to):
