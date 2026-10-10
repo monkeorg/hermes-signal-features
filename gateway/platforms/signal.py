@@ -30,7 +30,7 @@ from gateway.platforms.base import (
     cache_audio_from_bytes_async, cache_document_from_bytes_async, cache_image_from_url, utf16_len,
 )
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
-from gateway.platforms.helpers import redact_phone
+from gateway.platforms.helpers import redact_phone, compile_mention_patterns
 from gateway.platforms.helpers import cancel_task
 from gateway.platforms.media_cache import mime_for_ext
 from tools.audio_container import CONTAINER_TO_EXT, sniff_container
@@ -195,6 +195,11 @@ class SignalAdapter(BasePlatformAdapter):
         _rm_cfg = extra.get("require_mention")
         self.require_mention = (bool(_rm_cfg) if _rm_cfg is not None
                                 else (_sig_secret("SIGNAL_REQUIRE_MENTION", "false") or "false").lower() in TRUTHY_STRINGS)
+        # Wake-word patterns (regex, case-insensitive): with require_mention on, a group message that matches one
+        # (e.g. "chatbot") or that replies to the bot's own message counts as addressed, no @mention needed.
+        self._mention_patterns = compile_mention_patterns(
+            extra.get("mention_patterns") if "mention_patterns" in extra else _sig_secret("SIGNAL_MENTION_PATTERNS", "") or None,
+            log_prefix="signal", platform_label="Signal", logger_=logger)
         self.dm_allow_from = set(_parse_comma_list(_sig_secret("SIGNAL_ALLOWED_USERS", "*")))
         self.client: Optional[httpx.AsyncClient] = None
         self._sse_task: Optional[asyncio.Task] = None
@@ -380,7 +385,11 @@ class SignalAdapter(BasePlatformAdapter):
             mentioned_in_text = account_norm and (f"@{account_norm}" in (text or ""))
             mentioned_in_metadata = any(account_norm in (m.get("number"), m.get("uuid"))
                                         for m in (data_message.get("mentions") or []))
-            if not mentioned_in_text and not mentioned_in_metadata:
+            quote = data_message.get("quote") or {}
+            wake_word = any(pat.search(text or "") for pat in self._mention_patterns)
+            reply_to_bot = bool(quote) and self._quote_references_own_message(
+                str(quote.get("id")) if quote.get("id") else None, self._extract_quote_author(quote))
+            if not (mentioned_in_text or mentioned_in_metadata or wake_word or reply_to_bot):
                 logger.debug("Signal: ignoring group message (require_mention=true, bot not mentioned)")
                 return False, text
         if text and account_norm:
