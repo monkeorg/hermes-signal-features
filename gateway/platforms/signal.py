@@ -63,6 +63,11 @@ _SKIP_IMAGE_LOG = {
     "oversize": lambda url, detail: ("Signal: image too large (%d bytes), skipping %s", detail, url)}
 _QUOTE_AUTHOR_KEYS = (
     "author", "authorNumber", "authorUuid", "authorAci", "authorServiceId", "authorServiceIdString")
+# Outbound quote-replies (signal-cli ``send`` quoteTimestamp/quoteAuthor/quoteMessage).
+_QUOTE_POLICIES = ("groups", "always", "never")
+_QUOTE_PREVIEW_MAX = 200  # chars of the quoted message echoed as quoteMessage
+_QUOTE_POLICY_ALIASES = {"true": "always", "yes": "always", "on": "always", "1": "always",
+                         "false": "never", "no": "never", "off": "never", "0": "never", "none": "never"}
 
 
 def _parse_comma_list(value: str) -> list[str]:
@@ -143,6 +148,18 @@ def _render_mentions(text: str, mentions: list) -> str:
     return text
 
 
+def _parse_quote_policy(value: Any) -> str:
+    """Normalise ``quote_replies`` (groups | always | never; YAML booleans accepted) to a policy name."""
+    if value is None or value == "":
+        return "groups"
+    key = str(value).strip().lower()
+    key = _QUOTE_POLICY_ALIASES.get(key, key)
+    if key not in _QUOTE_POLICIES:
+        logger.warning("Signal: unknown quote_replies=%r (use groups|always|never); using 'groups'", value)
+        return "groups"
+    return key
+
+
 def _is_signal_service_id(value: str) -> bool:
     """Return True if *value* already looks like a Signal service identifier (PNI:/u: prefix or UUID)."""
     if not value:
@@ -201,6 +218,10 @@ class SignalAdapter(BasePlatformAdapter):
             extra.get("mention_patterns") if "mention_patterns" in extra else _sig_secret("SIGNAL_MENTION_PATTERNS", "") or None,
             log_prefix="signal", platform_label="Signal", logger_=logger)
         self.dm_allow_from = set(_parse_comma_list(_sig_secret("SIGNAL_ALLOWED_USERS", "*")))
+        # Quote the triggering message when replying: "groups" (default) = always in groups, in DMs only when
+        # the reply answers an older message than the chat's latest; "always"; "never".
+        self.quote_replies = _parse_quote_policy(
+            extra["quote_replies"] if "quote_replies" in extra else _sig_secret("SIGNAL_QUOTE_REPLIES", "") or None)
         self.client: Optional[httpx.AsyncClient] = None
         self._sse_task: Optional[asyncio.Task] = None
         self._health_monitor_task: Optional[asyncio.Task] = None
@@ -221,6 +242,11 @@ class SignalAdapter(BasePlatformAdapter):
         # replies to this bot are recognised after the echo was consumed.
         self._sent_message_timestamps: OrderedDict[str, None] = OrderedDict()
         self._max_sent_message_timestamps = 500
+        # Inbound timestamp -> (author, text) so a reply can build signal-cli's quote params (it needs both the
+        # timestamp and the author); plus the newest inbound timestamp per chat to detect "older message" replies.
+        self._inbound_by_ts: OrderedDict[str, tuple[str, str]] = OrderedDict()
+        self._max_inbound_by_ts = 512
+        self._last_inbound_ts_by_chat: dict[str, str] = {}
         # Best-effort number↔ACI/PNI UUID mapping so sends can upgrade a number to the UUID signal-cli prefers.
         self._recipient_uuid_by_number: dict[str, str] = {}
         self._recipient_number_by_uuid: dict[str, str] = {}
@@ -492,6 +518,8 @@ class SignalAdapter(BasePlatformAdapter):
         event = MessageEvent(
             source=source, text=text or "", message_type=msg_type, media_urls=media_urls,
             media_types=media_types, timestamp=timestamp,
+            # message_id (= Signal timestamp) becomes the reply anchor handed to send(reply_to=...).
+            message_id=str(ts_ms) if ts_ms else None,
             raw_message={"sender": sender, "timestamp_ms": ts_ms, "quote": quote_data if quote_data else None},
             reply_to_message_id=reply_to_id, reply_to_text=quote_data.get("text"),
             reply_to_author_id=reply_to_author,
@@ -499,6 +527,7 @@ class SignalAdapter(BasePlatformAdapter):
             reply_to_is_own_message=self._quote_references_own_message(reply_to_id, reply_to_author),
         )
         logger.debug("Signal: message from %s in %s: %s", redact_phone(sender), chat_id[:20], (text or "")[:50])
+        self._remember_inbound(chat_id, ts_ms, sender, text)
         await self.handle_message(event)
 
     def _group_allowed(self, group_id: str) -> bool:
@@ -534,6 +563,36 @@ class SignalAdapter(BasePlatformAdapter):
         # Cached number↔UUID mappings are only ever stored with truthy keys and values.
         return bool(acct) and (author == acct or author == self._recipient_uuid_by_number.get(acct)
                                or self._recipient_number_by_uuid.get(author) == acct)
+
+    def _remember_inbound(self, chat_id: str, timestamp: Any, author: str, text: str) -> None:
+        """Remember who sent the inbound message with *timestamp* (bounded FIFO) for quote/reaction targeting."""
+        if not timestamp or not author:
+            return
+        key = str(timestamp)
+        self._inbound_by_ts.pop(key, None)
+        self._inbound_by_ts[key] = (author, (text or "")[:_QUOTE_PREVIEW_MAX])
+        while len(self._inbound_by_ts) > self._max_inbound_by_ts:
+            self._inbound_by_ts.popitem(last=False)
+        self._last_inbound_ts_by_chat[chat_id] = key
+
+    def _quote_params(self, chat_id: str, reply_to: Optional[str]) -> dict[str, Any]:
+        """signal-cli quote params for a reply to the inbound message *reply_to* (its timestamp), or ``{}``."""
+        if not reply_to or self.quote_replies == "never":
+            return {}
+        known = self._inbound_by_ts.get(str(reply_to))
+        if not known:  # signal-cli only renders a quote when it gets both timestamp and author
+            return {}
+        if (self.quote_replies == "groups" and not chat_id.startswith("group:")
+                and self._last_inbound_ts_by_chat.get(chat_id) == str(reply_to)):
+            return {}  # DM answering the newest message: a quote adds nothing
+        author, preview = known
+        try:
+            params: dict[str, Any] = {"quoteTimestamp": int(reply_to), "quoteAuthor": author}
+        except (TypeError, ValueError):
+            return {}
+        if preview:
+            params["quoteMessage"] = preview
+        return params
 
     def _remember_sent_message_timestamp(self, timestamp: Any) -> None:
         """Keep a bounded cache of outbound Signal timestamps for quote matching."""
@@ -718,9 +777,12 @@ class SignalAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=None)
         base_params = await self._with_target({"account": self.account}, chat_id)
         chunks = self._split_signal_formatted_message(*markdown_to_signal(content), self.MAX_MESSAGE_LENGTH)
+        quote = self._quote_params(chat_id, reply_to)  # first chunk only
         last_result = None
         for idx, (plain_text, text_styles) in enumerate(chunks, start=1):
             params: dict[str, Any] = dict(base_params, message=plain_text)
+            if idx == 1 and quote:
+                params.update(quote)
             if len(text_styles) == 1:
                 params["textStyle"] = text_styles[0]
             elif text_styles:
@@ -728,6 +790,12 @@ class SignalAdapter(BasePlatformAdapter):
             logger.info("[Signal] Sending response chunk %d/%d (%d chars) to %s", idx, len(chunks), len(plain_text),
                         chat_id)
             last_result, err = await self._rpc_send(params, "RPC send failed")
+            if err and idx == 1 and quote:
+                # A stale/unknown quote target must never cost the reply itself.
+                logger.warning("[Signal] Send with quote failed (%s); retrying without quote", err.error)
+                for key in quote:
+                    params.pop(key, None)
+                last_result, err = await self._rpc_send(params, "RPC send failed")
             if err:
                 return err
         # No editable message identifier; message_id=None keeps the stream consumer on the non-edit path.
