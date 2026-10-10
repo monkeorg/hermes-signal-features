@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import random
+import re
 import shutil
 import subprocess
 import tempfile
@@ -63,6 +64,9 @@ _SKIP_IMAGE_LOG = {
     "oversize": lambda url, detail: ("Signal: image too large (%d bytes), skipping %s", detail, url)}
 _QUOTE_AUTHOR_KEYS = (
     "author", "authorNumber", "authorUuid", "authorAci", "authorServiceId", "authorServiceIdString")
+# Reaction-instead-of-text: a reply that starts with ``[[react:<emoji>]]`` becomes a Signal reaction on the
+# triggering message (any text after the token is still sent as a normal message).
+_REACT_TOKEN_RE = re.compile(r"^\s*\[\[react:\s*([^\[\]\s]{1,16})\s*\]\]\s*")
 # Outbound quote-replies (signal-cli ``send`` quoteTimestamp/quoteAuthor/quoteMessage).
 _QUOTE_POLICIES = ("groups", "always", "never")
 _QUOTE_PREVIEW_MAX = 200  # chars of the quoted message echoed as quoteMessage
@@ -160,6 +164,20 @@ def _parse_quote_policy(value: Any) -> str:
     return key
 
 
+def _split_react_token(content: str) -> tuple[Optional[str], str]:
+    """Split a leading ``[[react:<token>]]`` off *content*: ``(token | None, remaining text)``.
+
+    The token is always removed so the marker can never leak into a chat.
+    """
+    match = _REACT_TOKEN_RE.match(content or "")
+    return (match.group(1), content[match.end():]) if match else (None, content)
+
+
+def _is_reaction_emoji(token: str) -> bool:
+    """A plausible emoji: short, and free of ASCII letters/digits (rejects ``[[react:thumbsup]]``)."""
+    return bool(token) and len(token) <= 16 and not re.search(r"[A-Za-z0-9]", token)
+
+
 def _is_signal_service_id(value: str) -> bool:
     """Return True if *value* already looks like a Signal service identifier (PNI:/u: prefix or UUID)."""
     if not value:
@@ -222,6 +240,10 @@ class SignalAdapter(BasePlatformAdapter):
         # the reply answers an older message than the chat's latest; "always"; "never".
         self.quote_replies = _parse_quote_policy(
             extra["quote_replies"] if "quote_replies" in extra else _sig_secret("SIGNAL_QUOTE_REPLIES", "") or None)
+        # auto_react: let the agent answer with a reaction instead of text via a leading ``[[react:<emoji>]]``.
+        _ar_cfg = extra.get("auto_react")
+        self.auto_react = (bool(_ar_cfg) if _ar_cfg is not None
+                           else (_sig_secret("SIGNAL_AUTO_REACT", "false") or "false").lower() in TRUTHY_STRINGS)
         self.client: Optional[httpx.AsyncClient] = None
         self._sse_task: Optional[asyncio.Task] = None
         self._health_monitor_task: Optional[asyncio.Task] = None
@@ -247,6 +269,8 @@ class SignalAdapter(BasePlatformAdapter):
         self._inbound_by_ts: OrderedDict[str, tuple[str, str]] = OrderedDict()
         self._max_inbound_by_ts = 512
         self._last_inbound_ts_by_chat: dict[str, str] = {}
+        # (chat_id, inbound ts) the agent already reacted to: the ✅/❌ completion swap must not overwrite it.
+        self._agent_reacted: OrderedDict[tuple[str, str], None] = OrderedDict()
         # Best-effort number↔ACI/PNI UUID mapping so sends can upgrade a number to the UUID signal-cli prefers.
         self._recipient_uuid_by_number: dict[str, str] = {}
         self._recipient_number_by_uuid: dict[str, str] = {}
@@ -773,6 +797,13 @@ class SignalAdapter(BasePlatformAdapter):
                    metadata: Optional[dict[str, Any]] = None) -> SendResult:
         """Send a text message with native Signal formatting."""
         await self._stop_typing_indicator(chat_id)
+        token, content = _split_react_token(content)
+        if token is not None:
+            if self.auto_react and _is_reaction_emoji(token):
+                if not await self._react_to_trigger(chat_id, token, reply_to):
+                    logger.warning("[Signal] Reaction %s could not be delivered to %s", token, chat_id)
+            else:
+                logger.warning("[Signal] Dropped [[react:%s]] (auto_react off or not an emoji)", token)
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
         base_params = await self._with_target({"account": self.account}, chat_id)
@@ -1015,6 +1046,34 @@ class SignalAdapter(BasePlatformAdapter):
             logger.debug("Signal: sendReaction failed (chat=%s, emoji=%s)", chat_id[:20], emoji)
         return ok
 
+    def _remember_agent_reaction(self, chat_id: str, timestamp: Any) -> None:
+        """Note that the agent reacted to inbound *timestamp* (bounded) so the completion ✅/❌ leaves it alone."""
+        key = (chat_id, str(timestamp))
+        self._agent_reacted.pop(key, None)
+        self._agent_reacted[key] = None
+        while len(self._agent_reacted) > self._max_inbound_by_ts:
+            self._agent_reacted.popitem(last=False)
+
+    async def _react_to_trigger(self, chat_id: str, emoji: str, message_id: Optional[str] = None) -> bool:
+        """React with *emoji* to inbound message *message_id* (its timestamp), default the chat's newest inbound."""
+        ts = str(message_id) if message_id and str(message_id) in self._inbound_by_ts else None
+        ts = ts or self._last_inbound_ts_by_chat.get(chat_id)
+        known = self._inbound_by_ts.get(ts) if ts else None
+        if not known:
+            return False
+        ok = await self.send_reaction(chat_id, emoji, known[0], int(ts))
+        if ok:
+            self._remember_agent_reaction(chat_id, ts)
+        return ok
+
+    async def add_reaction(self, chat_id: str, emoji: str, message_id: Optional[str] = None) -> dict[str, Any]:
+        """``send_message(action="react")`` entry point; without *message_id* targets the chat's newest inbound."""
+        if not _is_reaction_emoji(emoji or ""):
+            return {"success": False, "error": f"Not an emoji: {emoji!r}"}
+        if not await self._react_to_trigger(chat_id, emoji, message_id):
+            return {"success": False, "error": "No known message to react to"}
+        return {"success": True}
+
     async def remove_reaction(self, chat_id: str, target_author: str, target_timestamp: int) -> bool:
         """Remove a reaction by sending an empty-string emoji."""
         return await self._send_reaction_rpc(chat_id, {
@@ -1046,6 +1105,8 @@ class SignalAdapter(BasePlatformAdapter):
             return
         if not (target := self._extract_reaction_target(event)):
             return
+        if (event.source.chat_id, str(target[1])) in self._agent_reacted:
+            return  # the agent's own reaction replaced the 👀; a ✅ would overwrite it
         await self.remove_reaction(event.source.chat_id, *target)
         if emoji := _OUTCOME_REACTION.get(outcome):
             await self.send_reaction(event.source.chat_id, emoji, *target)
